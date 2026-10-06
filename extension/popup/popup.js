@@ -8,7 +8,6 @@
 const $ = (id) => document.getElementById(id);
 
 let settings = null;
-let devicePollTimer = null;
 
 /* ------------------------------------------------------------------ */
 /* Загрузка состояния                                                   */
@@ -154,9 +153,23 @@ $('saveTokensBtn').addEventListener('click', async () => {
 });
 
 /* ------------------------------------------------------------------ */
-/* Discord OAuth2 Device Flow                                           */
-/* https://discord.com/developers/docs/topics/oauth2#device-code-grant  */
+/* Discord OAuth2 Device Flow — запуск через background                 */
+/*                                                                      */
+/* Раньше запрос шёл напрямую из popup и страница discord.com/activate  */
+/* не открывалась. Причины, которые устранены:                         */
+/*  1) window.open() из popup прерывается, т.к. popup закрывается при   */
+/*     потере фокуса — теперь вкладку открывает service worker          */
+/*     (chrome.tabs.create).                                            */
+/*  2) fetch к discord.com из popup блокировался CORS — теперь запросы  */
+/*     идут из background, покрытого host_permissions.                  */
+/*  3) Ошибки API были неинформативны («Failed to fetch») — теперь      */
+/*     показывается текст от Discord + подсказки (см. buildDiscordError)*/
+/*  4) Опрос токена живёт в chrome.alarms и переживает закрытие popup   */
+/*     и «засыпание» MV3 service worker.                                */
 /* ------------------------------------------------------------------ */
+
+let deviceStatusTimer = null;
+
 $('authBtn').addEventListener('click', async () => {
   const clientId = $('clientId').value.trim();
   if (!clientId) return toast('Сначала укажите Application ID', true);
@@ -164,79 +177,76 @@ $('authBtn').addEventListener('click', async () => {
   stopDevicePoll();
   $('deviceInfo').classList.remove('hidden');
   $('deviceStatus').textContent = 'Запрос кода…';
+  $('authBtn').disabled = true;
 
   try {
-    const res = await fetch('https://discord.com/api/oauth2/device/code', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ client_id: clientId, scope: 'rpc rpc.notifications.read' })
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
+    const res = await sendMessage({ type: 'START_DEVICE_FLOW', clientId });
+    if (!res || !res.ok) throw new Error((res && res.error) || 'background не ответил');
 
-    $('deviceCode').textContent = data.user_code;
-    $('deviceUrl').href = data.verification_uri_complete || data.verification_uri;
-    window.open(data.verification_uri_complete || data.verification_uri, '_blank');
-    $('deviceStatus').textContent = 'Ожидание подтверждения…';
-
-    pollDeviceToken(clientId, data.device_code, data.interval || 5, data.expires_in);
+    $('deviceCode').textContent = res.userCode;
+    $('deviceUrl').href = res.verificationUri;
+    $('deviceStatus').textContent =
+      'Вкладка Discord открыта автоматически. Подтвердите доступ — статус обновится сам.';
+    startDeviceStatusPoll(); // на случай, если popup закрыли и открыли заново
   } catch (e) {
-    $('deviceStatus').textContent = 'Не удалось запросить код: ' + e.message;
+    $('deviceStatus').innerHTML =
+      `Не удалось запросить код: <b>${escapeHtml(e.message)}</b><br>` +
+      '<span class="muted">Частые причины: неверный Application ID, Discord-приложение без включённого RPC, ' +
+      'расширение не перезагружено после обновления (chrome://extensions → ⟳), блокировка запроса антивирусом/прокси.</span>';
+  } finally {
+    $('authBtn').disabled = false;
   }
 });
 
-function pollDeviceToken(clientId, deviceCode, intervalSec, expiresIn) {
-  const started = Date.now();
-  devicePollTimer = setInterval(async () => {
-    if (Date.now() - started > expiresIn * 1000) {
-      stopDevicePoll();
-      $('deviceStatus').textContent = 'Код истёк. Попробуйте ещё раз.';
-      return;
-    }
-    try {
-      const res = await fetch('https://discord.com/api/oauth2/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          client_id: clientId,
-          scope: 'rpc rpc.notifications.read',
-          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-          device_code: deviceCode
-        })
-      });
-      const data = await res.json();
+/* Копирование кода в буфер обмена по клику */
+$('deviceCode').addEventListener('click', async () => {
+  const code = $('deviceCode').textContent.trim();
+  if (!code || code === '------') return;
+  try {
+    await navigator.clipboard.writeText(code);
+    toast('Код скопирован ✓');
+  } catch (e) {
+    /* буфер обмена недоступен — просто выделяем текст */
+  }
+});
 
-      if (res.ok && data.access_token) {
+/* Если Device Flow уже запущен в background — восстанавливаем UI опроса */
+async function restoreDeviceFlowUi() {
+  const st = await sendMessage({ type: 'DEVICE_FLOW_STATUS' });
+  if (!st || !st.ok) return;
+  if (st.active) {
+    $('deviceInfo').classList.remove('hidden');
+    $('deviceStatus').textContent = 'Ожидание подтверждения в Discord…';
+    startDeviceStatusPoll();
+  } else if (st.error) {
+    $('deviceInfo').classList.remove('hidden');
+    $('deviceStatus').textContent = st.error;
+  }
+}
+
+/* Раз в 2 с спрашиваем background: получил ли он токен? */
+function startDeviceStatusPoll() {
+  stopDevicePoll();
+  deviceStatusTimer = setInterval(async () => {
+    try {
+      const st = await sendMessage({ type: 'DEVICE_FLOW_STATUS' });
+      if (!st) return;
+      if (!st.active && st.hasToken) {
         stopDevicePoll();
-        $('deviceStatus').textContent = 'Готово! Токен получен ✓';
         $('deviceInfo').classList.add('hidden');
-        await sendMessage({
-          type: 'SET_TOKENS',
-          clientId,
-          accessToken: data.access_token,
-          refreshToken: data.refresh_token || '',
-          tokenExpiry: Date.now() + data.expires_in * 1000
-        });
-        toast('Discord подключён ✓');
+        toast(st.connected ? 'Discord подключён ✓' : 'Токен получен, но RPC-подключение не установлено');
         init();
-      } else if (data.error === 'authorization_pending' || data.error === 'slow_down') {
-        // ждём дальше
-      } else if (data.error === 'expired_token') {
+      } else if (!st.active && st.error) {
         stopDevicePoll();
-        $('deviceStatus').textContent = 'Код истёк.';
-      } else {
-        stopDevicePoll();
-        $('deviceStatus').textContent = 'Ошибка: ' + (data.error_description || data.error);
+        $('deviceStatus').textContent = st.error;
       }
-    } catch (e) {
-      /* сеть моргнула — продолжаем опрос */
-    }
-  }, intervalSec * 1000);
+    } catch (e) { /* SW мог уснуть — попробуем в следующий тик */ }
+  }, 2000);
 }
 
 function stopDevicePoll() {
-  if (devicePollTimer) clearInterval(devicePollTimer);
-  devicePollTimer = null;
+  if (deviceStatusTimer) clearInterval(deviceStatusTimer);
+  deviceStatusTimer = null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -260,3 +270,4 @@ setInterval(async () => {
 }, 3000);
 
 init();
+restoreDeviceFlowUi();

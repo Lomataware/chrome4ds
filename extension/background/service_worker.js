@@ -43,6 +43,16 @@ async function loadSettings() {
   const stored = await chrome.storage.sync.get('settings');
   settings = { ...DEFAULT_SETTINGS, ...(stored.settings || {}) };
   settings.platforms = { ...DEFAULT_SETTINGS.platforms, ...(settings.platforms || {}) };
+  // Токены — из local (см. saveSettings) + миграция старых версий,
+  // где они случайно попадали в sync.
+  const localStored = await chrome.storage.local.get('auth');
+  if (localStored.auth) {
+    settings.accessToken = localStored.auth.accessToken || '';
+    settings.refreshToken = localStored.auth.refreshToken || '';
+    settings.tokenExpiry = localStored.auth.tokenExpiry || 0;
+  } else if (stored.settings && stored.settings.accessToken) {
+    await saveSettings(); // переносим токены из sync в local
+  }
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
@@ -68,6 +78,15 @@ chrome.runtime.onStartup.addListener(async () => {
 /* ------------------------------------------------------------------ */
 /* Auth (OAuth2 Device Flow / Manual Token)                             */
 /* ------------------------------------------------------------------ */
+
+const DISCORD_API = 'https://discord.com/api';
+const DEVICE_SCOPE = 'rpc identify';
+const DEVICE_POLL_ALARM = 'drp-device-poll';
+
+let deviceFlow = null;          // активный Device Flow: {clientId, deviceCode, intervalMs, expiresAt}
+let devicePollBusy = false;     // предыдущий запрос ещё не завершился
+let lastDeviceError = '';       // последняя ошибка — для показа в popup
+
 let connectingPromise = null; // защита от параллельных подключений
 
 async function tryConnect() {
@@ -107,7 +126,7 @@ async function refreshAccessTokenIfNeeded() {
       settings.accessToken = data.access_token;
       settings.refreshToken = data.refresh_token || settings.refreshToken;
       settings.tokenExpiry = Date.now() + data.expires_in * 1000;
-      await saveSettings();
+      await saveWithAuth();
       console.log('[DRP] Access token refreshed');
     }
   } catch (e) {
@@ -116,7 +135,164 @@ async function refreshAccessTokenIfNeeded() {
 }
 
 async function saveSettings() {
+  // ВАЖНО: токены храним ОТДЕЛЬНО в chrome.storage.local.
+  // chrome.storage.sync имеет лимит ~8 КБ на значение и синхронизируется
+  // через аккаунт Google — из-за этого длинные access/refresh-токены
+  // раньше сохранялись молча с ошибкой, и «Получить токен» не работал.
+  const auth = {
+    accessToken: settings.accessToken || '',
+    refreshToken: settings.refreshToken || '',
+    tokenExpiry: settings.tokenExpiry || 0
+  };
+  const { accessToken, refreshToken, tokenExpiry, ...syncable } = settings;
+  void accessToken; void refreshToken; void tokenExpiry;
+  settings = syncable;
+
+  await chrome.storage.local.set({ auth });
   await chrome.storage.sync.set({ settings });
+}
+
+async function loadAuth() {
+  const stored = await chrome.storage.local.get('auth');
+  const auth = stored.auth || {};
+  settings.accessToken = auth.accessToken || '';
+  settings.refreshToken = auth.refreshToken || '';
+  settings.tokenExpiry = auth.tokenExpiry || 0;
+}
+
+async function clearAuth() {
+  settings.accessToken = '';
+  settings.refreshToken = '';
+  settings.tokenExpiry = 0;
+  await chrome.storage.local.remove('auth');
+}
+
+/* Сохранение после операций с токенами: сначала записываем auth в local
+   (пока поля ещё есть в settings), затем — очищенные настройки в sync. */
+async function saveWithAuth() {
+  const auth = {
+    accessToken: settings.accessToken || '',
+    refreshToken: settings.refreshToken || '',
+    tokenExpiry: settings.tokenExpiry || 0
+  };
+  await chrome.storage.local.set({ auth });
+  await saveSettings();
+}
+
+/* ------------------------------------------------------------------ */
+/* Discord OAuth2 Device Flow (выполняется в service worker)            */
+/*                                                                      */
+/* Раньше запросы шли напрямую из popup, и страница discord.com/activate*/
+/* не открывалась по двум причинам:                                    */
+/*  1) window.open() из popup закрывается вместе с popup — переход       */
+/*     обрывался;                                                        */
+/*  2) fetch к discord.com блокировался CORS (popup не покрыт            */
+/*     host_permissions).                                               */
+/* Теперь код запрашивает background, а ссылку открывает chrome.tabs.   */
+/* ------------------------------------------------------------------ */
+
+async function startDeviceFlow(clientId) {
+  const res = await fetch(`${DISCORD_API}/oauth2/device/code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: clientId, scope: DEVICE_SCOPE })
+  });
+
+  let data = {};
+  try { data = await res.json(); } catch (e) { /* HTML-ответ от Cloudflare/прокси */ }
+
+  if (!res.ok || !data.device_code || !data.user_code) {
+    throw new Error(buildDiscordError(res.status, data));
+  }
+
+  deviceFlow = {
+    clientId,
+    deviceCode: data.device_code,
+    intervalMs: Math.max(data.interval || 5, 3) * 1000,
+    expiresAt: Date.now() + (data.expires_in || 900) * 1000
+  };
+  lastDeviceError = '';
+
+  // Открываем страницу авторизации НОВОЙ вкладкой (не завися от popup-окна)
+  const verifyUrl = data.verification_uri_complete || data.verification_uri || 'https://discord.com/authorize';
+  await chrome.tabs.create({ url: verifyUrl, active: true });
+
+  // Опрос через alarm — переживает «засыпание» service worker'а в MV3
+  chrome.alarms.create(DEVICE_POLL_ALARM, { periodInMinutes: Math.max(deviceFlow.intervalMs / 60000, 0.5) });
+  pollDeviceToken().catch(() => {}); // первый опрос сразу, дальше — по alarm
+
+  return { userCode: data.user_code, verificationUri: verifyUrl, expiresIn: data.expires_in || 900 };
+}
+
+function buildDiscordError(status, data) {
+  const code = data.error_description || data.error || data.message || JSON.stringify(data);
+  if (status === 400 && /invalid.*client/i.test(String(code))) {
+    return `Неверный Application ID (${code}). Скопируйте Client ID со страницы General Information вашего приложения на discord.com/developers/applications`;
+  }
+  if (status === 403 || status === 429) {
+    return `Discord отклонил запрос (HTTP ${status}): ${code}. Попробуйте позже — возможно, сработала защита от ботов/флуда.`;
+  }
+  if (status >= 500) {
+    return `Ошибка сервера Discord (HTTP ${status}). Попробуйте ещё раз через минуту.`;
+  }
+  return `HTTP ${status}: ${code}`;
+}
+
+async function pollDeviceToken() {
+  if (!deviceFlow || devicePollBusy) return;
+  if (Date.now() > deviceFlow.expiresAt) {
+    stopDeviceFlow();
+    lastDeviceError = 'Код истёк. Нажмите «Получить токен» ещё раз.';
+    return;
+  }
+
+  devicePollBusy = true;
+  try {
+    const res = await fetch(`${DISCORD_API}/oauth2/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: deviceFlow.clientId,
+        scope: DEVICE_SCOPE,
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+        device_code: deviceFlow.deviceCode
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+
+    if (res.ok && data.access_token) {
+      settings.accessToken = data.access_token;
+      settings.refreshToken = data.refresh_token || '';
+      settings.tokenExpiry = Date.now() + (data.expires_in || 30 * 24 * 3600) * 1000;
+      settings.clientId = deviceFlow.clientId;
+      stopDeviceFlow();
+      await saveWithAuth();
+      try {
+        await tryConnect();
+        applyCurrentMedia();
+      } catch (e) {
+        lastDeviceError = 'Токен получен, но подключиться не удалось: ' + e.message;
+      }
+    } else if (data.error === 'authorization_pending' || data.error === 'slow_down') {
+      if (data.error === 'slow_down') deviceFlow.intervalMs += 5000; // RFC 8628
+    } else if (data.error === 'expired_token' || data.error === 'invalid_grant') {
+      stopDeviceFlow();
+      lastDeviceError = 'Код истёк или отклонён. Начните заново.';
+    } else if (data.error) {
+      stopDeviceFlow();
+      lastDeviceError = 'Discord вернул ошибку: ' + (data.error_description || data.error);
+    }
+  } catch (e) {
+    // Сеть моргнула — просто продолжим опрос по alarm
+    console.warn('[DRP] device poll network error', e);
+  } finally {
+    devicePollBusy = false;
+  }
+}
+
+function stopDeviceFlow() {
+  deviceFlow = null;
+  chrome.alarms.clear(DEVICE_POLL_ALARM);
 }
 
 /* ------------------------------------------------------------------ */
@@ -169,7 +345,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           enabled: settings.enabled,
           activity: rpc.currentActivity,
           settings,
-          hasToken: Boolean(settings.accessToken)
+          hasToken: Boolean(settings.accessToken),
+          deviceFlowActive: Boolean(deviceFlow),
+          deviceError: lastDeviceError || null
         });
         break;
       }
@@ -188,13 +366,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         break;
       }
 
+      /* Popup: запуск Device Flow (fetch + открытие вкладки — в background) */
+      case 'START_DEVICE_FLOW': {
+        try {
+          const info = await startDeviceFlow(msg.clientId);
+          sendResponse({ ok: true, ...info });
+        } catch (e) {
+          sendResponse({ ok: false, error: e.message });
+        }
+        break;
+      }
+
+      /* Popup: статус активного Device Flow (popup мог быть закрыт) */
+      case 'DEVICE_FLOW_STATUS': {
+        sendResponse({
+          ok: true,
+          active: Boolean(deviceFlow),
+          error: lastDeviceError || null,
+          connected: rpc.connected,
+          hasToken: Boolean(settings.accessToken)
+        });
+        break;
+      }
+
       /* Popup: вручную сохранить токены (для продвинутых пользователей) */
       case 'SET_TOKENS': {
         settings.accessToken = msg.accessToken || '';
         settings.refreshToken = msg.refreshToken || '';
         settings.clientId = msg.clientId || settings.clientId;
         settings.tokenExpiry = msg.tokenExpiry || Date.now() + 30 * 24 * 3600 * 1000;
-        await saveSettings();
+        await saveWithAuth();
         try {
           await tryConnect();
           applyCurrentMedia();
@@ -208,8 +409,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       /* Popup: отключить / разорвать соединение */
       case 'DISCONNECT': {
         rpc.disconnect();
-        settings.accessToken = '';
-        settings.refreshToken = '';
+        stopDeviceFlow();
+        lastDeviceError = '';
+        await clearAuth();
         await saveSettings();
         sendResponse({ ok: true });
         break;
@@ -408,6 +610,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
   if (alarm.name === 'drp-reconnect' && !rpc.connected && settings.accessToken && settings.clientId) {
     tryConnect().then(() => applyCurrentMedia()).catch(() => {});
+  }
+  // Опрос Device Flow — переживает «засыпание» service worker'а
+  if (alarm.name === DEVICE_POLL_ALARM) {
+    pollDeviceToken().catch(() => {});
   }
 });
 
