@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Discord Rich Presence — Настройки</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app">
+    <header>
+      <img src="../icons/icon48.png" alt="" class="logo" />
+      <div>
+        <h1>DRP Media</h1>
+        <p class="subtitle">Статус просматриваемого контента в Discord</p>
+      </div>
+      <span id="statusDot" class="dot off" title="Статус подключения"></span>
+    </header>
+
+    <!-- Статус-карточка текущей активности -->
+    <section class="card current" id="currentCard">
+      <div class="current-header">
+        <strong>Текущий статус</strong>
+        <span id="connLabel" class="badge badge-off">не подключено</span>
+      </div>
+      <div id="activityPreview" class="preview">
+        <em>Активность не отображается</em>
+      </div>
+      <button id="toggleEnabled" class="btn primary wide"></button>
+    </section>
+
+    <!-- Подключение Discord -->
+    <section class="card">
+      <h2>Подключение к Discord</h2>
+      <ol class="steps">
+        <li>Создайте приложение на <a href="https://discord.com/developers/applications" target="_blank">discord.com/developers/applications</a> и скопируйте <b>Application ID</b>.</li>
+        <li>В разделе Rich Presence → Art Assets загрузите иконки платформ (<code>youtube_logo</code>, <code>ytmusic_logo</code>, <code>soundcloud_logo</code> и т.д.).</li>
+        <li>Нажмите «Получить токен» ниже — откроется страница авторизации Discord (Device Flow).</li>
+      </ol>
+      <div class="row">
+        <label for="clientId">Application ID (Client ID)</label>
+        <input type="text" id="clientId" placeholder="1234567890123456789" autocomplete="off" />
+      </div>
+      <div class="row btn-row">
+        <button id="authBtn" class="btn primary">🔗 Получить токен (Device Flow)</button>
+        <button id="manualTokenBtn" class="btn ghost">Ввести токен вручную</button>
+      </div>
+      <div id="deviceInfo" class="device hidden">
+        <p>Вкладка авторизации открылась автоматически. Если нет — откройте <a id="deviceUrl" href="#" target="_blank">страницу Discord</a> и введите код:</p>
+        <div class="user-code" id="deviceCode" title="Клик — скопировать">------</div>
+        <p class="muted" id="deviceStatus">Ожидание подтверждения…</p>
+      </div>
+      <div id="manualBox" class="hidden">
+        <div class="row">
+          <label for="accessTokenInput">Access Token (scope: rpc)</label>
+          <input type="password" id="accessTokenInput" placeholder="rtfC..." autocomplete="off" />
+        </div>
+        <div class="row">
+          <label for="refreshTokenInput">Refresh Token (опционально)</label>
+          <input type="password" id="refreshTokenInput" autocomplete="off" />
+        </div>
+        <button id="saveTokensBtn" class="btn primary">Сохранить и подключить</button>
+      </div>
+      <div class="row btn-row">
+        <button id="disconnectBtn" class="btn danger">Отключить аккаунт</button>
+      </div>
+    </section>
+
+    <!-- Настройки отображения -->
+    <section class="card">
+      <h2>Что показывать в статусе</h2>
+      <label class="switch"><input type="checkbox" id="showTitle" /><span class="slider"></span> Название видео / трека</label>
+      <label class="switch"><input type="checkbox" id="showChannel" /><span class="slider"></span> Канал / исполнитель</label>
+      <label class="switch"><input type="checkbox" id="showProgress" /><span class="slider"></span> Прогресс воспроизведения (таймер)</label>
+      <label class="switch"><input type="checkbox" id="showButtons" /><span class="slider"></span> Кнопка со ссылкой на трек/видео</label>
+      <label class="switch"><input type="checkbox" id="hideSensitive" /><span class="slider"></span> Скрывать контент 18+ / explicit</label>
+      <div class="row">
+        <label for="pauseBehavior">При паузе плеера:</label>
+        <select id="pauseBehavior">
+          <option value="hide">Скрывать статус</option>
+          <option value="showPaused">Показывать «на паузе»</option>
+          <option value="keep">Ничего не менять</option>
+        </select>
+      </div>
+    </section>
+
+    <!-- Платформы -->
+    <section class="card">
+      <h2>Платформы</h2>
+      <label class="switch"><input type="checkbox" id="platYoutube" /><span class="slider"></span> ▶ YouTube</label>
+      <label class="switch"><input type="checkbox" id="platYtmusic" /><span class="slider"></span> 🎵 YouTube Music</label>
+      <label class="switch"><input type="checkbox" id="platSoundcloud" /><span class="slider"></span> ☁️ SoundCloud</label>
+    </section>
+
+    <footer>
+      <button id="saveBtn" class="btn primary wide">💾 Сохранить настройки</button>
+      <span id="toast" class="toast hidden"></span>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
